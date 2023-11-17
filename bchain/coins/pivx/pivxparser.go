@@ -1,19 +1,24 @@
 package pivx
 
 import (
+	//	"bytes"
+	//	"encoding/hex"
+	//	"encoding/json"
+	//	"io"
+	//	"math/big"
 	"bytes"
-	"encoding/hex"
-	"encoding/json"
-	"io"
-	"math/big"
+	"fmt"
 
 	"github.com/juju/errors"
-	"github.com/martinboehm/btcd/blockchain"
+	//	"github.com/martinboehm/btcd/blockchain"
+	"github.com/martinboehm/btcd/txscript"
 	"github.com/martinboehm/btcd/wire"
+	"github.com/martinboehm/btcutil"
 	"github.com/martinboehm/btcutil/chaincfg"
 	"github.com/trezor/blockbook/bchain"
 	"github.com/trezor/blockbook/bchain/coins/btc"
-	"github.com/trezor/blockbook/bchain/coins/utils"
+	//"github.com/trezor/blockbook/bchain/coins/utils"
+	//	"github.com/trezor/blockbook/bchain/coins/utils"
 )
 
 // magic numbers
@@ -24,6 +29,9 @@ const (
 	// Zerocoin op codes
 	OP_ZEROCOINMINT  = 0xc1
 	OP_ZEROCOINSPEND = 0xc2
+
+	OP_CHECKCOLDSTAKEVERIFY_LOF = 0xd1
+	 OP_CHECKCOLDSTAKEVERIFY = 0xd2
 )
 
 // chain parameters
@@ -53,6 +61,7 @@ type PivXParser struct {
 	*btc.BitcoinLikeParser
 	baseparser                         *bchain.BaseParser
 	BitcoinOutputScriptToAddressesFunc btc.OutputScriptToAddressesFunc
+	stakingAddrHashId []byte
 }
 
 // NewPivXParser returns new PivXParser instance
@@ -62,7 +71,13 @@ func NewPivXParser(params *chaincfg.Params, c *btc.Configuration) *PivXParser {
 		baseparser:        &bchain.BaseParser{},
 	}
 	p.BitcoinOutputScriptToAddressesFunc = p.OutputScriptToAddressesFunc
-	p.OutputScriptToAddressesFunc = p.outputScriptToAddresses
+	switch params.Net.String() {
+	case "test":
+		p.stakingAddrHashId = []byte{63}
+	default:
+		p.stakingAddrHashId = []byte{73}
+	}
+	//p.OutputScriptToAddressesFunc = p.outputScriptToAddresses
 	return p
 }
 
@@ -77,6 +92,8 @@ func GetChainParams(chain string) *chaincfg.Params {
 			panic(err)
 		}
 	}
+	fmt.Println(chain);
+
 	switch chain {
 	case "test":
 		return &TestNetParams
@@ -85,38 +102,19 @@ func GetChainParams(chain string) *chaincfg.Params {
 	}
 }
 
-// ParseBlock parses raw block to our Block struct
-func (p *PivXParser) ParseBlock(b []byte) (*bchain.Block, error) {
-	r := bytes.NewReader(b)
-	w := wire.MsgBlock{}
-	h := wire.BlockHeader{}
-	err := h.Deserialize(r)
-	if err != nil {
-		return nil, errors.Annotatef(err, "Deserialize")
-	}
+func (p *PivXParser) stakePKHToAddress(bytes []byte) (string, error) {
+	// Hack: Because btcutils expects a chainCfg obj,
+	// We'll temporarely switch the Pubkeyhasid of params
+	save := p.Params.PubKeyHashAddrID
+	p.Params.PubKeyHashAddrID = p.stakingAddrHashId
+	addr, err := btcutil.NewAddressPubKeyHash(bytes, p.Params)
+	p.Params.PubKeyHashAddrID = save
+	return addr.EncodeAddress(), err
+}
 
-	if h.Version > 3 && h.Version < 7 {
-		// Skip past AccumulatorCheckpoint (block version 4, 5 and 6)
-		r.Seek(32, io.SeekCurrent)
-	}
-
-	err = utils.DecodeTransactions(r, 0, wire.WitnessEncoding, &w)
-	if err != nil {
-		return nil, errors.Annotatef(err, "DecodeTransactions")
-	}
-
-	txs := make([]bchain.Tx, len(w.Transactions))
-	for ti, t := range w.Transactions {
-		txs[ti] = p.TxFromMsgTx(t, false)
-	}
-
-	return &bchain.Block{
-		BlockHeader: bchain.BlockHeader{
-			Size: len(b),
-			Time: h.Timestamp.Unix(),
-		},
-		Txs: txs,
-	}, nil
+func (p *PivXParser) pkhToAddress(bytes []byte) (string, error) {
+	addr, err := btcutil.NewAddressPubKeyHash(bytes, p.Params)
+	return addr.EncodeAddress(), err
 }
 
 // PackTx packs transaction to byte array using protobuf
@@ -129,138 +127,71 @@ func (p *PivXParser) UnpackTx(buf []byte) (*bchain.Tx, uint32, error) {
 	return p.baseparser.UnpackTx(buf)
 }
 
-// ParseTx parses byte array containing transaction and returns Tx struct
-func (p *PivXParser) ParseTx(b []byte) (*bchain.Tx, error) {
-	t := wire.MsgTx{}
-	r := bytes.NewReader(b)
-	if err := t.Deserialize(r); err != nil {
-		return nil, err
-	}
-	tx := p.TxFromMsgTx(&t, true)
-	tx.Hex = hex.EncodeToString(b)
-	return &tx, nil
+// GetAddrDescFromAddress returns internal address representation (descriptor) of given address
+func (p *PivXParser) GetAddrDescFromAddress(address string) (bchain.AddressDescriptor, error) {
+	return p.BitcoinLikeParser.GetAddrDescFromAddress(address)
 }
 
-// TxFromMsgTx parses tx and adds handling for OP_ZEROCOINSPEND inputs
-func (p *PivXParser) TxFromMsgTx(t *wire.MsgTx, parseAddresses bool) bchain.Tx {
-	vin := make([]bchain.Vin, len(t.TxIn))
-	for i, in := range t.TxIn {
-
-		// extra check to not confuse Tx with single OP_ZEROCOINSPEND input as a coinbase Tx
-		if !isZeroCoinSpendScript(in.SignatureScript) && blockchain.IsCoinBaseTx(t) {
-			vin[i] = bchain.Vin{
-				Coinbase: hex.EncodeToString(in.SignatureScript),
-				Sequence: in.Sequence,
-			}
-			break
-		}
-
-		s := bchain.ScriptSig{
-			Hex: hex.EncodeToString(in.SignatureScript),
-			// missing: Asm,
-		}
-
-		txid := in.PreviousOutPoint.Hash.String()
-
-		vin[i] = bchain.Vin{
-			Txid:      txid,
-			Vout:      in.PreviousOutPoint.Index,
-			Sequence:  in.Sequence,
-			ScriptSig: s,
-		}
+// GetAddressesFromAddrDesc returns addresses for given address descriptor with flag if the addresses are searchable
+func (p *PivXParser) GetAddressesFromAddrDesc(addrDesc bchain.AddressDescriptor) ([]string, bool, error) {
+	fmt.Println(addrDesc)
+	if len(addrDesc) == 0 {
+		return []string{ "Coinbase Tx" }, false, nil
 	}
-	vout := make([]bchain.Vout, len(t.TxOut))
-	for i, out := range t.TxOut {
-		addrs := []string{}
-		if parseAddresses {
-			addrs, _, _ = p.OutputScriptToAddressesFunc(out.PkScript)
-		}
-		s := bchain.ScriptPubKey{
-			Hex:       hex.EncodeToString(out.PkScript),
-			Addresses: addrs,
-			// missing: Asm,
-			// missing: Type,
-		}
-		var vs big.Int
-		vs.SetInt64(out.Value)
-		vout[i] = bchain.Vout{
-			ValueSat:     vs,
-			N:            uint32(i),
-			ScriptPubKey: s,
-		}
-	}
-	tx := bchain.Tx{
-		Txid:     t.TxHash().String(),
-		Version:  t.Version,
-		LockTime: t.LockTime,
-		Vin:      vin,
-		Vout:     vout,
-		// skip: BlockHash,
-		// skip: Confirmations,
-		// skip: Time,
-		// skip: Blocktime,
-	}
-	return tx
-}
-
-// ParseTxFromJson parses JSON message containing transaction and returns Tx struct
-func (p *PivXParser) ParseTxFromJson(msg json.RawMessage) (*bchain.Tx, error) {
-	var tx bchain.Tx
-	err := json.Unmarshal(msg, &tx)
+	addr, isSearchable, err := p.parseColdStakeAddress(addrDesc)
 	if err != nil {
-		return nil, err
+		return p.BitcoinLikeParser.GetAddressesFromAddrDesc(addrDesc)
 	}
+	return addr, isSearchable, nil
 
-	for i := range tx.Vout {
-		vout := &tx.Vout[i]
-		// convert vout.JsonValue to big.Int and clear it, it is only temporary value used for unmarshal
-		vout.ValueSat, err = p.AmountToBigInt(vout.JsonValue)
+}
+
+
+func (p *PivXParser) parseColdStakeAddress(addrDesc bchain.AddressDescriptor) ([]string, bool,
+	error) {
+	add := bytes.NewReader(addrDesc)
+	first_part := []byte {
+		txscript.OP_DUP, txscript.OP_HASH160, txscript.OP_ROT, txscript.OP_IF,
+	}
+	if len(addrDesc) == 51 {
+		for _, b := range first_part {
+			byte, err := add.ReadByte()
+			if err != nil || byte != b {
+				return nil, false, errors.New("Invalid cold stake address")
+			}
+		}
+
+		bb, err := add.ReadByte()
+		if err != nil || (bb != OP_CHECKCOLDSTAKEVERIFY && bb != OP_CHECKCOLDSTAKEVERIFY_LOF) {
+			return nil, false, errors.New("Invalid cold stake address")
+		}
+		pkh1 := make([]byte, 21)
+		n, err := add.Read(pkh1)
+		if n != 21 || err != nil {
+			return nil, false, errors.New("Invalid cold stake address")
+		}
+		bb, err = add.ReadByte()
+		if err != nil || bb != txscript.OP_ELSE {
+			print(bb)
+			return nil, false, errors.New("Invalid cold stake address")
+		}
+		
+		pkh2 := make([]byte, 21)
+		n, err = add.Read(pkh2)
+		if n != 21 || err != nil {
+			return nil, false, errors.New("Invalid cold stake address")
+		}
+
+		add1, err := p.stakePKHToAddress(pkh1[1:])
 		if err != nil {
-			return nil, err
+			return nil, false, errors.New("Invalid cold stake address")
 		}
-		vout.JsonValue = ""
-
-		if vout.ScriptPubKey.Addresses == nil {
-			vout.ScriptPubKey.Addresses = []string{}
+		add2, err := p.pkhToAddress(pkh2[1:])
+		if err != nil {
+			return nil, false, errors.New("Invalid cold stake address")
 		}
+		return []string{ add1, add2 }, true, nil
+
 	}
-
-	return &tx, nil
-}
-
-// outputScriptToAddresses converts ScriptPubKey to bitcoin addresses
-func (p *PivXParser) outputScriptToAddresses(script []byte) ([]string, bool, error) {
-	if isZeroCoinSpendScript(script) {
-		return []string{"Zerocoin Spend"}, false, nil
-	}
-	if isZeroCoinMintScript(script) {
-		return []string{"Zerocoin Mint"}, false, nil
-	}
-
-	rv, s, _ := p.BitcoinOutputScriptToAddressesFunc(script)
-	return rv, s, nil
-}
-
-func (p *PivXParser) GetAddrDescForUnknownInput(tx *bchain.Tx, input int) bchain.AddressDescriptor {
-	if len(tx.Vin) > input {
-		scriptHex := tx.Vin[input].ScriptSig.Hex
-
-		if scriptHex != "" {
-			script, _ := hex.DecodeString(scriptHex)
-			return script
-		}
-	}
-
-	s := make([]byte, 10)
-	return s
-}
-
-// Checks if script is OP_ZEROCOINMINT
-func isZeroCoinMintScript(signatureScript []byte) bool {
-	return len(signatureScript) > 1 && signatureScript[0] == OP_ZEROCOINMINT
-}
-
-// Checks if script is OP_ZEROCOINSPEND
-func isZeroCoinSpendScript(signatureScript []byte) bool {
-	return len(signatureScript) >= 100 && signatureScript[0] == OP_ZEROCOINSPEND
+	return nil, false, errors.New("Invalid cold stake address")
 }
